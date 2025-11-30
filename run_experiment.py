@@ -1,4 +1,4 @@
-"""Run the Solow growth with memory experiment using the AIF-PINN solver."""
+"""Run configurable AIF-PINN experiments for benchmark SPFDE problems."""
 
 from __future__ import annotations
 
@@ -11,75 +11,80 @@ import numpy as np
 import torch
 
 from aif_pinn import (
+    AbstractSPFDE,
     AIFPINNModel,
     DataGenerator,
     FractionalDerivativeOperator,
+    LinearRelaxationProblem,
+    NonlinearLogisticProblem,
     PINNSolver,
-    ProblemConfig,
-    mittag_leffler_approx,
+    VariableCoeffProblem,
 )
 
 
 class Visualizer:
-    """Utility to compare the AIF-PINN solution with a reference curve."""
+    """Utility to compare the AIF-PINN solution with optional reference curves."""
 
-    def __init__(self, boundary_layer_extent: float) -> None:
-        self.boundary_layer_extent = float(boundary_layer_extent)
+    def __init__(self, *, boundary_layer_width: float, problem_label: str) -> None:
+        self.boundary_layer_width = float(boundary_layer_width)
+        self.problem_label = problem_label
 
     def plot(
         self,
         pinn_t: np.ndarray,
         pinn_u: np.ndarray,
         *,
-        reference_t: Optional[np.ndarray] = None,
         reference_u: Optional[np.ndarray] = None,
+        coefficient_curve: Optional[np.ndarray] = None,
+        coefficient_label: str = "Coefficient",
         save_path: Optional[Path] = None,
         show: bool = True,
     ) -> None:
         fig, ax = plt.subplots(figsize=(9, 4.5))
         ax.plot(pinn_t, pinn_u, label="AIF-PINN", linewidth=2.0, color="#1f77b4")
 
-        if reference_t is not None and reference_u is not None:
+        if reference_u is not None:
             ax.plot(
-                reference_t,
+                pinn_t,
                 reference_u,
-                label="Mittag-Leffler reference",
+                label="Exact / reference",
                 linestyle="--",
                 color="#d62728",
-                linewidth=1.5,
+                linewidth=1.2,
             )
 
-        # Highlight the boundary layer to show rapid relaxation.
-        ax.axvspan(
-            0.0,
-            self.boundary_layer_extent,
-            color="#ffbb78",
-            alpha=0.3,
-            label="Boundary layer",
-        )
+        if self.boundary_layer_width > 0.0:
+            extent = min(self.boundary_layer_width, float(pinn_t[-1]))
+            ax.axvspan(
+                0.0,
+                extent,
+                color="#ffbb78",
+                alpha=0.25,
+                label="Boundary layer",
+            )
 
         ax.set_xlabel("t")
         ax.set_ylabel("u(t)")
-        ax.set_title("Solow growth with memory: AIF-PINN vs reference")
-        ax.grid(True, which="both", linestyle=":")
-        ax.legend(loc="best")
+        ax.set_title(f"AIF-PINN solution: {self.problem_label}")
+        ax.grid(True, linestyle=":", linewidth=0.8)
 
-        # A symlog scale emphasises the heavy tail without hiding early recovery.
-        ax.set_yscale("symlog", linthresh=1e-3)
-        ax.annotate(
-            "Fast recovery\n(pogranichny sloy)",
-            xy=(self.boundary_layer_extent * 0.6, pinn_u[1]),
-            xytext=(self.boundary_layer_extent * 1.2, pinn_u[1] * 0.5),
-            arrowprops=dict(arrowstyle="->", color="black"),
-            fontsize=10,
-        )
-        ax.annotate(
-            "Power-law tail\n(fractional memory)",
-            xy=(pinn_t[-1], pinn_u[-1]),
-            xytext=(pinn_t[-1] * 0.6, pinn_u[-1] * 0.8),
-            arrowprops=dict(arrowstyle="->", color="black"),
-            fontsize=10,
-        )
+        handles, labels = ax.get_legend_handles_labels()
+        if coefficient_curve is not None:
+            secondary = ax.twinx()
+            coeff_line, = secondary.plot(
+                pinn_t,
+                coefficient_curve,
+                color="#ff7f0e",
+                linestyle="--",
+                linewidth=1.5,
+                label=coefficient_label,
+            )
+            secondary.set_ylabel(coefficient_label)
+            secondary.grid(False)
+            handles.append(coeff_line)
+            labels.append(coefficient_label)
+
+        ax.legend(handles, labels, loc="best")
 
         fig.tight_layout()
         if save_path is not None:
@@ -94,18 +99,33 @@ class Visualizer:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train AIF-PINN on the fractional Solow growth model.")
+    parser = argparse.ArgumentParser(description="Train AIF-PINN on benchmark SPFDE problems.")
+    parser.add_argument(
+        "--problem",
+        type=str,
+        default="linear",
+        choices=("linear", "variable", "logistic"),
+        help="Which benchmark problem to solve.",
+    )
     parser.add_argument("--num-collocation", type=int, default=512, help="Number of collocation points.")
     parser.add_argument("--adam-steps", type=int, default=3000, help="Number of Adam iterations.")
     parser.add_argument("--lbfgs-iter", type=int, default=2000, help="Number of L-BFGS iterations.")
     parser.add_argument("--adam-lr", type=float, default=1e-3, help="Adam learning rate.")
+    parser.add_argument("--alpha", type=float, default=0.8, help="Fractional order alpha.")
     parser.add_argument("--epsilon", type=float, default=0.05, help="Relaxation parameter epsilon.")
     parser.add_argument("--horizon", type=float, default=5.0, help="Time horizon for training and evaluation.")
+    parser.add_argument(
+        "--initial-condition",
+        type=float,
+        default=None,
+        help="Override the default initial condition for the chosen problem.",
+    )
     parser.add_argument("--device", type=str, default="cpu", help="torch device to run on.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("figures") / "solow_aif_pinn.png",
+        default=Path("figures") / "aif_pinn_benchmark.png",
         help="Where to save the plot.",
     )
     parser.add_argument("--no-show", action="store_true", help="Do not display the matplotlib window.")
@@ -117,21 +137,21 @@ def seed_everything(seed: int = 42) -> None:
     np.random.seed(seed)
 
 
-def build_solver(config: ProblemConfig, args: argparse.Namespace, device: torch.device) -> tuple[PINNSolver, np.ndarray]:
-    generator = DataGenerator(config)
+def build_solver(problem: AbstractSPFDE, args: argparse.Namespace, device: torch.device) -> tuple[PINNSolver, np.ndarray]:
+    generator = DataGenerator(problem)
     grid = generator.generate_grid(args.num_collocation)
-    operator = FractionalDerivativeOperator(grid, config.alpha, dtype=torch.float32, device=device)
+    operator = FractionalDerivativeOperator(grid, problem.alpha, dtype=torch.float32, device=device)
     model = AIFPINNModel(
-        alpha=config.alpha,
-        epsilon=config.epsilon,
-        initial_condition=config.initial_condition,
+        alpha=problem.alpha,
+        epsilon=problem.epsilon,
+        initial_condition=problem.initial_condition,
         hidden_layers=(128, 128, 64),
         mittag_series_terms=8,
     )
     solver = PINNSolver(
         model,
         operator,
-        config,
+        problem,
         dtype=torch.float32,
         device=device,
     )
@@ -146,31 +166,39 @@ def evaluate_model(model: torch.nn.Module, t_eval: np.ndarray, device: torch.dev
         return prediction.cpu().numpy().reshape(-1)
 
 
-def mittag_leffler_reference(t_eval: np.ndarray, config: ProblemConfig) -> Optional[np.ndarray]:
-    alpha = config.alpha
-    eps = torch.tensor(config.epsilon, dtype=torch.float32)
-    u0 = torch.tensor(config.initial_condition, dtype=torch.float32)
-    t_tensor = torch.as_tensor(t_eval, dtype=torch.float32).reshape(-1, 1)
-    eps_alpha = torch.pow(eps, alpha)
-    z = -torch.pow(torch.clamp(t_tensor, min=0.0), alpha) / eps_alpha
-    ml = mittag_leffler_approx(z, alpha, series_terms=12, switch_threshold=1.0)
-    return (u0 * ml.squeeze(-1)).cpu().numpy()
+def compute_reference(problem: AbstractSPFDE, t_eval: np.ndarray, device: torch.device) -> Optional[np.ndarray]:
+    t_tensor = torch.as_tensor(t_eval, dtype=torch.float32, device=device).reshape(-1, 1)
+    with torch.no_grad():
+        reference = problem.exact_solution(t_tensor)
+    if reference is None:
+        return None
+    return reference.detach().cpu().numpy().reshape(-1)
+
+
+def create_problem(args: argparse.Namespace) -> AbstractSPFDE:
+    registry: dict[str, type[AbstractSPFDE]] = {
+        "linear": LinearRelaxationProblem,
+        "variable": VariableCoeffProblem,
+        "logistic": NonlinearLogisticProblem,
+    }
+    defaults = {"linear": 1.0, "variable": 0.5, "logistic": 0.1}
+    problem_cls = registry[args.problem]
+    initial_condition = args.initial_condition if args.initial_condition is not None else defaults[args.problem]
+    return problem_cls(
+        alpha=args.alpha,
+        epsilon=args.epsilon,
+        initial_condition=initial_condition,
+        horizon=args.horizon,
+    )
 
 
 def main() -> None:
     args = parse_args()
-    seed_everything()
-
-    config = ProblemConfig(
-        alpha=0.8,
-        epsilon=args.epsilon,
-        lambda_coeff=1.0,
-        initial_condition=-0.5,
-        horizon=args.horizon,
-    )
-
+    seed_everything(args.seed)
     device = torch.device(args.device)
-    solver, grid = build_solver(config, args, device)
+
+    problem = create_problem(args)
+    solver, grid = build_solver(problem, args, device)
     history = solver.train(
         adam_steps=args.adam_steps,
         adam_lr=args.adam_lr,
@@ -180,16 +208,20 @@ def main() -> None:
 
     print(f"Training complete. Final loss: {history['lbfgs'][-1] if history['lbfgs'] else history['adam'][-1]:.3e}")
 
-    dense_t = np.linspace(0.0, config.horizon, num=1000, dtype=np.float32)
+    dense_t = np.linspace(0.0, problem.horizon, num=1000, dtype=np.float32)
     pinn_solution = evaluate_model(solver.model, dense_t, device)
-    reference_solution = mittag_leffler_reference(dense_t, config)
+    reference_solution = compute_reference(problem, dense_t, device)
+    coefficient_curve = None
+    if args.problem == "variable":
+        coefficient_curve = 1.0 + 0.5 * np.sin(4.0 * np.pi * dense_t)
 
-    visualizer = Visualizer(boundary_layer_extent=config.boundary_layer_extent)
+    visualizer = Visualizer(boundary_layer_width=problem.boundary_layer_width(), problem_label=args.problem.title())
     visualizer.plot(
         dense_t,
         pinn_solution,
-        reference_t=dense_t if reference_solution is not None else None,
         reference_u=reference_solution,
+        coefficient_curve=coefficient_curve,
+        coefficient_label="1 + 0.5 sin(4*pi*t)",
         save_path=args.output,
         show=not args.no_show,
     )

@@ -1,38 +1,67 @@
-"""Problem configuration objects for AIF-PINN experiments."""
+"""Problem abstractions shared by AIF-PINN components."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-import torch
+from abc import ABC, abstractmethod
+from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - for typing only
     from torch import Tensor
 
 
-@dataclass
-class ProblemConfig:
-    """Configuration container for the SPFDE derived from the Solow-Swan model."""
+class AbstractSPFDE(ABC):
+    """Abstract base class describing a single-state fractional differential equation."""
 
-    alpha: float = 0.8
-    epsilon: float = 0.05
-    lambda_coeff: float = 1.0
-    initial_condition: float = -0.5
-    horizon: float = 1.0
+    def __init__(
+        self,
+        *,
+        alpha: float,
+        epsilon: float,
+        initial_condition: float,
+        horizon: float,
+    ) -> None:
+        if alpha <= 0.0:
+            raise ValueError("alpha must be positive.")
+        if not (0.0 < epsilon):
+            raise ValueError("epsilon must be positive.")
+        if horizon <= 0.0:
+            raise ValueError("horizon must be positive.")
+
+        self._alpha = float(alpha)
+        self._epsilon = float(epsilon)
+        self._initial_condition = float(initial_condition)
+        self._horizon = float(horizon)
+        self._eps_alpha = float(pow(self._epsilon, self._alpha))
 
     @property
-    def boundary_layer_extent(self) -> float:
-        """Width of the inner layer that requires refined sampling."""
+    def alpha(self) -> float:
+        return self._alpha
 
-        return 5.0 * self.epsilon
+    @property
+    def epsilon(self) -> float:
+        return self._epsilon
 
-    def rhs(self, x: Tensor) -> Tensor:
-        """Right-hand side forcing term f(x); override for custom scenarios."""
+    @property
+    def initial_condition(self) -> float:
+        return self._initial_condition
 
-        if not torch.is_tensor(x):
-            raise TypeError("rhs expects a torch.Tensor input.")
-        return torch.zeros_like(x)
+    @property
+    def horizon(self) -> float:
+        return self._horizon
+
+    def boundary_layer_width(self) -> float:
+        """Width of the inner boundary layer, defaults to a multiple of epsilon."""
+
+        return 5.0 * self._epsilon
+
+    @abstractmethod
+    def residual(self, t: "Tensor", u: "Tensor", du_dt: "Tensor") -> "Tensor":
+        """Residual F(t, u, D^alpha u) that the solver drives to zero."""
+
+    def exact_solution(self, t: "Tensor") -> Optional["Tensor"]:
+        """Optional reference solution for visual comparison."""
+
+        return None
 
 
-__all__ = ["ProblemConfig"]
+__all__ = ["AbstractSPFDE"]

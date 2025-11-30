@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
 from .model import AIFPINNModel
 from .operators import FractionalDerivativeOperator
-from .problem import ProblemConfig
+from .problem import AbstractSPFDE
 
 
 class PINNSolver:
@@ -18,19 +18,14 @@ class PINNSolver:
         self,
         model: AIFPINNModel,
         operator: FractionalDerivativeOperator,
-        problem_config: ProblemConfig,
+        problem: AbstractSPFDE,
         *,
-        rhs_function: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
     ) -> None:
-        if rhs_function is not None and not callable(rhs_function):
-            raise TypeError("rhs_function must be callable.")
-
         self.model = model
         self.operator = operator
-        self.problem_config = problem_config
-        self._rhs_fn = rhs_function
+        self.problem = problem
 
         sample_param = next(self.model.parameters(), None)
         resolved_device = device or (sample_param.device if sample_param is not None else torch.device("cpu"))
@@ -46,24 +41,13 @@ class PINNSolver:
             device=self.device,
         ).reshape(-1, 1)
 
-        eps_tensor = torch.tensor(float(self.problem_config.epsilon), dtype=self.dtype, device=self.device)
-        self._eps_alpha = torch.pow(eps_tensor, float(self.problem_config.alpha))
-        self._lambda = torch.tensor(float(self.problem_config.lambda_coeff), dtype=self.dtype, device=self.device)
-
-    def _rhs(self, x: torch.Tensor) -> torch.Tensor:
-        if self._rhs_fn is not None:
-            return self._rhs_fn(x)
-        return self.problem_config.rhs(x)
-
     def loss_function(self) -> torch.Tensor:
         """Residual loss of the SPFDE."""
 
         x = self.grid_tensor
         u_pred = self.model(x)
         Pu = self.operator.apply(u_pred)
-        rhs = self._rhs(x)
-
-        residual = self._eps_alpha * Pu + self._lambda * u_pred - rhs
+        residual = self.problem.residual(x, u_pred, Pu)
         return torch.mean(torch.square(residual))
 
     def train(

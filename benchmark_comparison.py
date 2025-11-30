@@ -15,9 +15,8 @@ from aif_pinn import (
     AIFPINNModel,
     DataGenerator,
     FractionalDerivativeOperator,
+    LinearRelaxationProblem,
     PINNSolver,
-    ProblemConfig,
-    mittag_leffler_approx,
 )
 
 
@@ -37,7 +36,7 @@ class BenchmarkResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compare AIF-PINN accuracy for several epsilon values.")
+    parser = argparse.ArgumentParser(description="Compare AIF-PINN accuracy on the linear relaxation problem.")
     parser.add_argument(
         "--epsilons",
         type=float,
@@ -54,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon", type=float, default=5.0, help="Time horizon for training and evaluation.")
     parser.add_argument("--device", type=str, default="cpu", help="torch device to run on.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument(
+        "--initial-condition",
+        type=float,
+        default=1.0,
+        help="Initial condition for the benchmark problem.",
+    )
     parser.add_argument("--eval-points", type=int, default=1000, help="Number of evaluation points for error metrics.")
     parser.add_argument(
         "--figure",
@@ -70,21 +75,21 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
 
 
-def build_solver(config: ProblemConfig, args: argparse.Namespace, device: torch.device) -> PINNSolver:
-    generator = DataGenerator(config)
+def build_solver(problem: LinearRelaxationProblem, args: argparse.Namespace, device: torch.device) -> PINNSolver:
+    generator = DataGenerator(problem)
     grid = generator.generate_grid(args.num_collocation)
-    operator = FractionalDerivativeOperator(grid, config.alpha, dtype=torch.float32, device=device)
+    operator = FractionalDerivativeOperator(grid, problem.alpha, dtype=torch.float32, device=device)
     model = AIFPINNModel(
-        alpha=config.alpha,
-        epsilon=config.epsilon,
-        initial_condition=config.initial_condition,
+        alpha=problem.alpha,
+        epsilon=problem.epsilon,
+        initial_condition=problem.initial_condition,
         hidden_layers=(128, 128, 64),
         mittag_series_terms=8,
     )
     solver = PINNSolver(
         model,
         operator,
-        config,
+        problem,
         dtype=torch.float32,
         device=device,
     )
@@ -99,15 +104,13 @@ def evaluate_model(model: torch.nn.Module, t_eval: np.ndarray, device: torch.dev
         return prediction.cpu().numpy().reshape(-1)
 
 
-def mittag_leffler_reference(t_eval: np.ndarray, config: ProblemConfig) -> np.ndarray:
-    alpha = config.alpha
-    eps = torch.tensor(config.epsilon, dtype=torch.float32)
-    u0 = torch.tensor(config.initial_condition, dtype=torch.float32)
-    t_tensor = torch.as_tensor(t_eval, dtype=torch.float32).reshape(-1, 1)
-    eps_alpha = torch.pow(eps, alpha)
-    z = -torch.pow(torch.clamp(t_tensor, min=0.0), alpha) / eps_alpha
-    ml = mittag_leffler_approx(z, alpha, series_terms=12, switch_threshold=1.0)
-    return (u0 * ml.squeeze(-1)).cpu().numpy()
+def compute_reference(problem: LinearRelaxationProblem, t_eval: np.ndarray, device: torch.device) -> np.ndarray:
+    t_tensor = torch.as_tensor(t_eval, dtype=torch.float32, device=device).reshape(-1, 1)
+    with torch.no_grad():
+        reference = problem.exact_solution(t_tensor)
+    if reference is None:
+        raise RuntimeError("LinearRelaxationProblem must provide an exact solution.")
+    return reference.detach().cpu().numpy().reshape(-1)
 
 
 def compute_error_metrics(prediction: np.ndarray, reference: np.ndarray) -> tuple[float, float]:
@@ -123,14 +126,13 @@ def run_single_benchmark(
     args: argparse.Namespace,
     device: torch.device,
 ) -> BenchmarkResult:
-    config = ProblemConfig(
+    problem = LinearRelaxationProblem(
         alpha=args.alpha,
         epsilon=epsilon,
-        lambda_coeff=1.0,
-        initial_condition=-0.5,
+        initial_condition=args.initial_condition,
         horizon=args.horizon,
     )
-    solver = build_solver(config, args, device)
+    solver = build_solver(problem, args, device)
     history = solver.train(
         adam_steps=args.adam_steps,
         adam_lr=args.adam_lr,
@@ -138,9 +140,9 @@ def run_single_benchmark(
         lbfgs_max_iter=args.lbfgs_iter,
         verbose=True,
     )
-    dense_t = np.linspace(0.0, config.horizon, num=args.eval_points, dtype=np.float32)
+    dense_t = np.linspace(0.0, problem.horizon, num=args.eval_points, dtype=np.float32)
     pinn_solution = evaluate_model(solver.model, dense_t, device)
-    reference_solution = mittag_leffler_reference(dense_t, config)
+    reference_solution = compute_reference(problem, dense_t, device)
     l2_error, max_error = compute_error_metrics(pinn_solution, reference_solution)
 
     adam_steps_ran = len(history["adam"]) if history["adam"] else 0
@@ -148,7 +150,7 @@ def run_single_benchmark(
 
     return BenchmarkResult(
         epsilon=epsilon,
-        alpha=config.alpha,
+        alpha=problem.alpha,
         l2_error=l2_error,
         max_error=max_error,
         adam_steps=adam_steps_ran,

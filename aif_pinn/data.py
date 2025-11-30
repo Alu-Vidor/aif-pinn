@@ -6,7 +6,7 @@ from typing import Optional
 
 import numpy as np
 
-from .problem import ProblemConfig
+from .problem import AbstractSPFDE
 
 
 class DataGenerator:
@@ -14,8 +14,8 @@ class DataGenerator:
 
     _MIN_POSITIVE = np.finfo(float).tiny
 
-    def __init__(self, config: ProblemConfig) -> None:
-        self.config = config
+    def __init__(self, problem: AbstractSPFDE) -> None:
+        self.problem = problem
 
     def generate_grid(self, num_points: int) -> np.ndarray:
         """Create a log-uniform + uniform grid for the SPFDE collocation points."""
@@ -23,9 +23,9 @@ class DataGenerator:
         if num_points < 2:
             raise ValueError("num_points must be at least 2 to split between regions.")
 
-        layer_extent = min(self.config.boundary_layer_extent, self.config.horizon)
+        layer_extent = min(self.problem.boundary_layer_width(), self.problem.horizon)
         if layer_extent <= 0.0:
-            return np.linspace(0.0, self.config.horizon, num=num_points)
+            return np.linspace(0.0, self.problem.horizon, num=num_points)
 
         n_layer = num_points // 2
         n_outer = num_points - n_layer
@@ -89,10 +89,10 @@ class DataGenerator:
         if n_outer <= 0:
             return np.empty(0, dtype=np.float64)
 
-        if layer_extent >= self.config.horizon:
-            return np.linspace(0.0, self.config.horizon, num=n_outer, endpoint=True, dtype=np.float64)
+        if layer_extent >= self.problem.horizon:
+            return np.linspace(0.0, self.problem.horizon, num=n_outer, endpoint=True, dtype=np.float64)
 
-        return np.linspace(layer_extent, self.config.horizon, num=n_outer, endpoint=True, dtype=np.float64)
+        return np.linspace(layer_extent, self.problem.horizon, num=n_outer, endpoint=True, dtype=np.float64)
 
 
 __all__ = ["DataGenerator"]
