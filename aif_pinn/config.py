@@ -1,6 +1,7 @@
 """Convenience exports for the core AIF-PINN components."""
 
 from .data import DataGenerator
+from .fdm_solver import FDMSolver, solve_variable_coeff
 from .mittag import mittag_leffler_approx
 from .model import AIFPINNModel
 from .operators import FractionalDerivativeOperator
@@ -22,4 +23,6 @@ __all__ = [
     "LinearRelaxationProblem",
     "VariableCoeffProblem",
     "NonlinearLogisticProblem",
+    "FDMSolver",
+    "solve_variable_coeff",
 ]

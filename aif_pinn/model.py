@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 from torch import nn
@@ -23,6 +23,7 @@ class AIFPINNModel(nn.Module):
         activation: type[nn.Module] = nn.Tanh,
         mittag_series_terms: int = 6,
         mittag_switch_threshold: float = 1.0,
+        inverse_problem: bool = False,
     ) -> None:
         super().__init__()
         if alpha <= 0.0:
@@ -37,11 +38,21 @@ class AIFPINNModel(nn.Module):
         self.activation_cls = activation
         self.mittag_series_terms = mittag_series_terms
         self.mittag_switch_threshold = mittag_switch_threshold
+        self.inverse_problem = bool(inverse_problem)
 
-        self.register_buffer("_epsilon", torch.tensor(float(epsilon)))
+        if self.inverse_problem:
+            alpha_tensor = torch.tensor(float(alpha))
+            alpha_tensor = torch.clamp(alpha_tensor, 1e-3, 1.0 - 1e-3)
+            self.logit_alpha = nn.Parameter(torch.logit(alpha_tensor))
+            self.log_epsilon = nn.Parameter(torch.log(torch.tensor(float(epsilon))))
+            self._epsilon = None
+        else:
+            self.register_buffer("_epsilon", torch.tensor(float(epsilon)))
+
         self.register_buffer("_u0", torch.tensor(float(initial_condition)))
 
         self.net = self._build_network(input_dim=4)
+        self._eps_floor = 1e-6
 
     def _build_network(self, input_dim: int) -> nn.Module:
         layers: list[nn.Module] = []
@@ -60,16 +71,31 @@ class AIFPINNModel(nn.Module):
         layers.append(nn.Linear(prev_dim, 1))
         return nn.Sequential(*layers)
 
+    def _resolved_alpha(self, ref: torch.Tensor) -> torch.Tensor:
+        if self.inverse_problem:
+            alpha = torch.sigmoid(self.logit_alpha)
+            return alpha.to(dtype=ref.dtype, device=ref.device)
+        return ref.new_tensor(self.alpha)
+
+    def _resolved_epsilon(self, ref: torch.Tensor) -> torch.Tensor:
+        if self.inverse_problem:
+            eps = torch.exp(self.log_epsilon) + self._eps_floor
+            return eps.to(dtype=ref.dtype, device=ref.device)
+        if self._epsilon is None:
+            raise RuntimeError("epsilon buffer is not initialized.")
+        return self._epsilon.to(dtype=ref.dtype, device=ref.device)
+
     def _feature_embedding(self, x: torch.Tensor) -> torch.Tensor:
-        eps = self._epsilon.to(dtype=x.dtype, device=x.device)
-        eps_alpha = torch.pow(eps, self.alpha)
+        eps = self._resolved_epsilon(x)
+        alpha = self._resolved_alpha(x)
+        eps_alpha = torch.pow(eps, alpha)
         x_scaled = x / eps
         x_clamped = torch.clamp(x, min=0.0)
-        x_alpha = torch.pow(x_clamped, self.alpha)
+        x_alpha = torch.pow(torch.clamp(x_clamped, min=1e-12), alpha)
         z = -x_alpha / eps_alpha
         mittag = mittag_leffler_approx(
             z,
-            self.alpha,
+            float(alpha.detach().cpu().item()) if torch.is_tensor(alpha) else self.alpha,
             series_terms=self.mittag_series_terms,
             switch_threshold=self.mittag_switch_threshold,
         )
@@ -84,11 +110,41 @@ class AIFPINNModel(nn.Module):
         features = self._feature_embedding(x)
         raw_output = self.net(features)
 
-        eps = self._epsilon.to(dtype=x.dtype, device=x.device)
+        eps = self._resolved_epsilon(x)
         u0 = self._u0.to(dtype=x.dtype, device=x.device)
         constraint = 1.0 - torch.exp(-x / eps)
 
         return u0 + constraint * raw_output
+
+    def alpha_tensor(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        ref = torch.zeros(1, 1, device=device or self._u0.device, dtype=dtype or self._u0.dtype)
+        return self._resolved_alpha(ref)
+
+    def epsilon_tensor(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        ref = torch.zeros(1, 1, device=device or self._u0.device, dtype=dtype or self._u0.dtype)
+        return self._resolved_epsilon(ref)
+
+    def alpha_value(self) -> float:
+        if self.inverse_problem:
+            return float(torch.sigmoid(self.logit_alpha).detach().cpu().item())
+        return self.alpha
+
+    def epsilon_value(self) -> float:
+        if self.inverse_problem:
+            return float((torch.exp(self.log_epsilon) + self._eps_floor).detach().cpu().item())
+        if self._epsilon is None:
+            raise RuntimeError("epsilon buffer is not initialized.")
+        return float(self._epsilon.detach().cpu().item())
 
 
 __all__ = ["AIFPINNModel"]

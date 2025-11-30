@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+import numpy as np
 import torch
 
 from .mittag import mittag_leffler_approx
@@ -59,9 +60,25 @@ class VariableCoeffProblem(_BaseProblem):
 
     def residual(self, t: torch.Tensor, u: torch.Tensor, du_dt: torch.Tensor) -> torch.Tensor:
         eps_alpha = self._eps_alpha_tensor(t)
-        coeff = 1.0 + 0.5 * torch.sin(t * self._freq)
-        forcing = torch.cos(t)
+        coeff = self.reaction_coefficient(t)
+        forcing = self.forcing(t)
         return eps_alpha * du_dt + coeff * u - forcing
+
+    def reaction_coefficient(self, t):
+        """Evaluate the time-dependent reaction coefficient a(t)."""
+
+        if torch.is_tensor(t):
+            return 1.0 + 0.5 * torch.sin(t * self._freq)
+        array = np.asarray(t, dtype=np.float64)
+        return 1.0 + 0.5 * np.sin(array * self._freq)
+
+    def forcing(self, t):
+        """Evaluate the right-hand side forcing term f(t)."""
+
+        if torch.is_tensor(t):
+            return torch.cos(t)
+        array = np.asarray(t, dtype=np.float64)
+        return np.cos(array)
 
 
 class NonlinearLogisticProblem(_BaseProblem):
