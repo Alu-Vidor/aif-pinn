@@ -22,6 +22,7 @@ class PINNSolver:
         *,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        use_jit: bool = False,
     ) -> None:
         self.model = model
         self.operator = operator
@@ -32,6 +33,13 @@ class PINNSolver:
         resolved_dtype = dtype or (sample_param.dtype if sample_param is not None else torch.float32)
 
         self.model.to(device=resolved_device, dtype=resolved_dtype)
+
+        if use_jit:
+            if hasattr(torch, "compile"):
+                self.model = torch.compile(self.model)
+            else:  # pragma: no cover - depends on torch version
+                raise RuntimeError("torch.compile requires PyTorch 2.0 or newer.")
+
         self.device = resolved_device
         self.dtype = resolved_dtype
 
@@ -40,13 +48,19 @@ class PINNSolver:
             dtype=self.dtype,
             device=self.device,
         ).reshape(-1, 1)
+        self.diff_matrix = torch.as_tensor(
+            self.operator.compute_matrix_P(),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.operator.matrix_tensor = self.diff_matrix
 
     def loss_function(self) -> torch.Tensor:
         """Residual loss of the SPFDE."""
 
         x = self.grid_tensor
         u_pred = self.model(x)
-        Pu = self.operator.apply(u_pred)
+        Pu = torch.matmul(self.diff_matrix, u_pred)
         residual = self.problem.residual(x, u_pred, Pu)
         return torch.mean(torch.square(residual))
 

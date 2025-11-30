@@ -129,6 +129,7 @@ def parse_args() -> argparse.Namespace:
         help="Where to save the plot.",
     )
     parser.add_argument("--no-show", action="store_true", help="Do not display the matplotlib window.")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile (PyTorch 2.0+) for the PINN.")
     return parser.parse_args()
 
 
@@ -154,6 +155,7 @@ def build_solver(problem: AbstractSPFDE, args: argparse.Namespace, device: torch
         problem,
         dtype=torch.float32,
         device=device,
+        use_jit=args.compile,
     )
     return solver, grid
 

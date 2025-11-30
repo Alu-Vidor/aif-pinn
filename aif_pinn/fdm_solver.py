@@ -31,7 +31,7 @@ class FDMSolver:
     def assemble_system(self) -> Tuple[np.ndarray, np.ndarray]:
         """Build A and b for (epsilon^alpha P + I) u = b with u(0) = u0."""
 
-        matrix_P = np.array(self.operator._precomputed_matrix, copy=True)  # pylint: disable=protected-access
+        matrix_P = np.array(self.operator.compute_matrix_P(), copy=True)
         n_points = matrix_P.shape[0]
         eps_alpha = float(pow(self.problem.epsilon, self.problem.alpha))
 
@@ -61,7 +61,7 @@ def solve_variable_coeff(problem: AbstractSPFDE, grid_points: int) -> Tuple[np.n
 
     grid = np.linspace(0.0, problem.horizon, num=grid_points, dtype=np.float64)
     operator = FractionalDerivativeOperator(grid, problem.alpha)
-    matrix_P = np.array(operator._precomputed_matrix, copy=True)  # pylint: disable=protected-access
+    matrix_P = np.array(operator.compute_matrix_P(), copy=True)
     n_points = matrix_P.shape[0]
     eps_alpha = float(pow(problem.epsilon, problem.alpha))
 
