@@ -354,7 +354,7 @@ def main() -> None:
         epsilon=0.1,
         initial_condition=problem.initial_condition,
         hidden_layers=(128, 128, 64),
-        mittag_series_terms=8,
+        mittag_series_terms=12,
         inverse_problem=True,
     ).to(device)
 
