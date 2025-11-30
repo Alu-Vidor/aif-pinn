@@ -20,8 +20,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-observations", type=int, default=50, help="Number of noisy data points.")
     parser.add_argument("--num-collocation", type=int, default=256, help="Number of collocation points for physics loss.")
     parser.add_argument("--noise-level", type=float, default=0.05, help="Relative noise level (fraction of std).")
-    parser.add_argument("--train-steps", type=int, default=5, help="Number of Adam iterations.")
-    parser.add_argument("--lr", type=float, default=3e-3, help="Adam learning rate.")
+    parser.add_argument("--train-steps", type=int, default=2000, help="Number of Adam iterations.")
+    parser.add_argument("--lr", type=float, default=1e-2, help="Adam learning rate.")
     parser.add_argument("--physics-weight", type=float, default=1.0, help="Weight for the physics residual.")
     parser.add_argument("--log-every", type=int, default=200, help="Logging frequency for training metrics.")
     parser.add_argument(
@@ -70,24 +70,31 @@ def fractional_derivative(u: torch.Tensor, grid: torch.Tensor, alpha: torch.Tens
     alpha_scalar = alpha.reshape(())
     dtype = grid.dtype
     device = grid.device
+    grid = grid.reshape(-1)
     n_points = grid.numel()
-    outputs = [torch.zeros_like(u[0])]
+    if n_points < 2:
+        return torch.zeros_like(u)
+
     inv_gamma = torch.exp(-torch.lgamma(torch.tensor(2.0, dtype=dtype, device=device) - alpha_scalar))
+    deltas = torch.clamp(grid[1:] - grid[:-1], min=1e-12)
+    power = 1.0 - alpha_scalar
 
-    for j in range(1, n_points):
-        x_j = grid[j]
-        acc = torch.zeros_like(u[0])
-        for k in range(1, j + 1):
-            delta = torch.clamp(grid[k] - grid[k - 1], min=1e-12)
-            diff_prev = torch.clamp(x_j - grid[k - 1], min=1e-12)
-            diff_curr = torch.clamp(x_j - grid[k], min=1e-12)
-            power = 1.0 - alpha_scalar
-            weight = (diff_prev.pow(power) - diff_curr.pow(power)) / delta
-            coeff = inv_gamma * weight
-            acc = acc + coeff * (u[k] - u[k - 1])
-        outputs.append(acc)
+    grid_prev = grid[:-1]
+    grid_curr = grid[1:]
+    grid_all = grid.unsqueeze(1)
+    diff_prev = torch.clamp(grid_all - grid_prev.unsqueeze(0), min=1e-12)
+    diff_curr = torch.clamp(grid_all - grid_curr.unsqueeze(0), min=1e-12)
+    weights = (diff_prev.pow(power) - diff_curr.pow(power)) / deltas.unsqueeze(0)
 
-    return torch.stack(outputs, dim=0)
+    k_indices = torch.arange(1, n_points, device=device).unsqueeze(0)
+    j_indices = torch.arange(n_points, device=device).unsqueeze(1)
+    lower_mask = (j_indices >= k_indices).to(weights.dtype)
+    weights = weights * lower_mask
+
+    du = (u[1:] - u[:-1]).reshape(n_points - 1, -1)
+    frac = inv_gamma * (weights @ du)
+    frac = frac.reshape(u.shape[0], *u.shape[1:])
+    return frac
 
 
 def train_inverse_model(
@@ -102,7 +109,8 @@ def train_inverse_model(
     log_every: int,
 ) -> Dict[str, List[float]]:
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    history: Dict[str, List[float]] = {"loss": [], "alpha": [], "epsilon": []}
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+    history: Dict[str, List[float]] = {"loss": [], "alpha": [], "epsilon": [], "grad_norm": []}
     grid_flat = t_collocation.squeeze(-1)
 
     for step in range(train_steps):
@@ -120,12 +128,15 @@ def train_inverse_model(
 
         loss = data_loss + physics_weight * physics_loss
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
 
         with torch.no_grad():
             history["loss"].append(float(loss.detach().cpu().item()))
             history["alpha"].append(model.alpha_value())
             history["epsilon"].append(model.epsilon_value())
+            history["grad_norm"].append(float(grad_norm.detach().cpu().item()))
 
         if (step + 1) % log_every == 0 or step == train_steps - 1:
             print(
@@ -134,7 +145,8 @@ def train_inverse_model(
                 f"Data={float(data_loss.detach().cpu().item()):.3e} | "
                 f"Physics={float(physics_loss.detach().cpu().item()):.3e} | "
                 f"alpha={history['alpha'][-1]:.4f} | "
-                f"epsilon={history['epsilon'][-1]:.5f}"
+                f"epsilon={history['epsilon'][-1]:.5f} | "
+                f"Grad={history['grad_norm'][-1]:.3e}"
             )
 
     return history
