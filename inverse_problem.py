@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Dict, List
 
@@ -22,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise-level", type=float, default=0.05, help="Relative noise level (fraction of std).")
     parser.add_argument("--train-steps", type=int, default=2000, help="Number of Adam iterations.")
     parser.add_argument("--lr", type=float, default=1e-2, help="Adam learning rate.")
-    parser.add_argument("--physics-weight", type=float, default=1.0, help="Weight for the physics residual.")
+    parser.add_argument("--physics-weight", type=float, default=1e-3, help="Weight for the physics residual.")
     parser.add_argument("--log-every", type=int, default=200, help="Logging frequency for training metrics.")
     parser.add_argument(
         "--figure-solution",
@@ -52,7 +53,19 @@ def generate_noisy_data(
     noise_level: float,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    t = torch.linspace(0.0, problem.horizon, steps=num_points, dtype=torch.float32, device=device).reshape(-1, 1)
+    if num_points <= 0:
+        raise ValueError("num_points must be positive.")
+
+    positive_points = max(num_points - 1, 1)
+    t_positive = torch.logspace(
+        math.log10(1e-4),
+        math.log10(problem.horizon),
+        steps=positive_points,
+        device=device,
+        dtype=torch.float32,
+    ).reshape(-1, 1)
+    t_zero = torch.zeros(1, 1, device=device)
+    t = torch.cat([t_zero, t_positive], dim=0)
     with torch.no_grad():
         clean = problem.exact_solution(t).to(device)
     noise_std = noise_level * torch.std(clean)
@@ -108,13 +121,98 @@ def train_inverse_model(
     physics_weight: float,
     log_every: int,
 ) -> Dict[str, List[float]]:
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+    def _set_inverse_params_grad(enabled: bool) -> None:
+        if not getattr(model, "inverse_problem", False):
+            return
+        if hasattr(model, "logit_alpha"):
+            model.logit_alpha.requires_grad = enabled
+        if hasattr(model, "log_epsilon"):
+            model.log_epsilon.requires_grad = enabled
+
+    def _make_optimizer() -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.ExponentialLR]:
+        params = [p for p in model.parameters() if p.requires_grad]
+        if not params:
+            raise RuntimeError("No trainable parameters available for optimization.")
+        optimizer = torch.optim.Adam(params, lr=lr)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
+        return optimizer, scheduler
+
     history: Dict[str, List[float]] = {"loss": [], "alpha": [], "epsilon": [], "grad_norm": []}
     grid_flat = t_collocation.squeeze(-1)
 
-    for step in range(train_steps):
-        optimizer.zero_grad()
+    if train_steps > 0:
+        warmup_steps = max(1, train_steps // 2)
+        discovery_steps = train_steps - warmup_steps
+        phases = [
+            {"name": "Warm-up", "steps": warmup_steps, "physics_weight": 0.0, "train_inverse": False},
+            {"name": "Discovery", "steps": discovery_steps, "physics_weight": physics_weight, "train_inverse": True},
+        ]
+    else:
+        phases = []
+
+    global_step = 0
+    for phase in phases:
+        phase_steps = phase["steps"]
+        if phase_steps <= 0:
+            continue
+
+        _set_inverse_params_grad(phase["train_inverse"])
+        optimizer, scheduler = _make_optimizer()
+        current_weight = phase["physics_weight"]
+
+        for _ in range(phase_steps):
+            optimizer.zero_grad()
+            pred_data = model(t_data)
+            data_loss = torch.mean(torch.square(pred_data - noisy_data))
+
+            if current_weight > 0.0:
+                u_collocation = model(t_collocation)
+                alpha_tensor = model.alpha_tensor(device=t_collocation.device, dtype=t_collocation.dtype)
+                epsilon_tensor = model.epsilon_tensor(device=t_collocation.device, dtype=t_collocation.dtype)
+                frac_u = fractional_derivative(u_collocation, grid_flat, alpha_tensor)
+                eps_alpha = torch.pow(epsilon_tensor, alpha_tensor)
+                residual = eps_alpha * frac_u + u_collocation
+                physics_loss = torch.mean(torch.square(residual))
+            else:
+                physics_loss = torch.zeros(1, device=t_collocation.device, dtype=t_collocation.dtype)
+
+            loss = data_loss + current_weight * physics_loss
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+
+            global_step += 1
+            with torch.no_grad():
+                history["loss"].append(float(loss.detach().cpu().item()))
+                history["alpha"].append(model.alpha_value())
+                history["epsilon"].append(model.epsilon_value())
+                history["grad_norm"].append(float(grad_norm.detach().cpu().item()))
+
+            if (global_step % log_every == 0) or (global_step == train_steps):
+                print(
+                    f"Step {global_step:5d}/{train_steps} | "
+                    f"Phase={phase['name']} | "
+                    f"Loss={history['loss'][-1]:.3e} | "
+                    f"Data={float(data_loss.detach().cpu().item()):.3e} | "
+                    f"Physics={float(physics_loss.detach().cpu().item()):.3e} | "
+                    f"alpha={history['alpha'][-1]:.4f} | "
+                    f"epsilon={history['epsilon'][-1]:.5f} | "
+                    f"Grad={history['grad_norm'][-1]:.3e}"
+                )
+
+    _set_inverse_params_grad(True)
+
+    lbfgs = torch.optim.LBFGS(
+        model.parameters(),
+        lr=1.0,
+        max_iter=100,
+        history_size=50,
+        line_search_fn="strong_wolfe",
+    )
+
+    def closure() -> torch.Tensor:
+        lbfgs.zero_grad()
         pred_data = model(t_data)
         data_loss = torch.mean(torch.square(pred_data - noisy_data))
 
@@ -128,26 +226,34 @@ def train_inverse_model(
 
         loss = data_loss + physics_weight * physics_loss
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
+        return loss
 
-        with torch.no_grad():
-            history["loss"].append(float(loss.detach().cpu().item()))
-            history["alpha"].append(model.alpha_value())
-            history["epsilon"].append(model.epsilon_value())
-            history["grad_norm"].append(float(grad_norm.detach().cpu().item()))
+    lbfgs.step(closure)
 
-        if (step + 1) % log_every == 0 or step == train_steps - 1:
-            print(
-                f"Step {step + 1:5d}/{train_steps} | "
-                f"Loss={history['loss'][-1]:.3e} | "
-                f"Data={float(data_loss.detach().cpu().item()):.3e} | "
-                f"Physics={float(physics_loss.detach().cpu().item()):.3e} | "
-                f"alpha={history['alpha'][-1]:.4f} | "
-                f"epsilon={history['epsilon'][-1]:.5f} | "
-                f"Grad={history['grad_norm'][-1]:.3e}"
-            )
+    with torch.no_grad():
+        pred_data = model(t_data)
+        data_loss = torch.mean(torch.square(pred_data - noisy_data))
+        u_collocation = model(t_collocation)
+        alpha_tensor = model.alpha_tensor(device=t_collocation.device, dtype=t_collocation.dtype)
+        epsilon_tensor = model.epsilon_tensor(device=t_collocation.device, dtype=t_collocation.dtype)
+        frac_u = fractional_derivative(u_collocation, grid_flat, alpha_tensor)
+        eps_alpha = torch.pow(epsilon_tensor, alpha_tensor)
+        residual = eps_alpha * frac_u + u_collocation
+        physics_loss = torch.mean(torch.square(residual))
+        loss = data_loss + physics_weight * physics_loss
+        final_alpha = model.alpha_value()
+        final_epsilon = model.epsilon_value()
+        history["loss"].append(float(loss.detach().cpu().item()))
+        history["alpha"].append(final_alpha)
+        history["epsilon"].append(final_epsilon)
+        print(
+            "L-BFGS Done | "
+            f"Loss={float(loss.detach().cpu().item()):.3e} | "
+            f"Data={float(data_loss.detach().cpu().item()):.3e} | "
+            f"Physics={float(physics_loss.detach().cpu().item()):.3e} | "
+            f"alpha={final_alpha:.4f} | "
+            f"epsilon={final_epsilon:.5f}"
+        )
 
     return history
 
