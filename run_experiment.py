@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train AIF-PINN on the fractional Solow growth model.")
     parser.add_argument("--num-collocation", type=int, default=512, help="Number of collocation points.")
     parser.add_argument("--adam-steps", type=int, default=3000, help="Number of Adam iterations.")
-    parser.add_argument("--lbfgs-iter", type=int, default=200, help="Number of L-BFGS iterations.")
+    parser.add_argument("--lbfgs-iter", type=int, default=2000, help="Number of L-BFGS iterations.")
     parser.add_argument("--adam-lr", type=float, default=1e-3, help="Adam learning rate.")
     parser.add_argument("--epsilon", type=float, default=0.05, help="Relaxation parameter epsilon.")
     parser.add_argument("--horizon", type=float, default=5.0, help="Time horizon for training and evaluation.")

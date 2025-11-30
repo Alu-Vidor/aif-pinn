@@ -224,14 +224,15 @@ def _mittag_leffler_approx(
         result[small_mask] = series
 
     if (~small_mask).any():
-        # Simple asymptotic 1/z behaviour in the outer region of the boundary layer.
+        # Use the leading term of the asymptotic expansion -1/(z * Gamma(1 - alpha)).
         large_z = z[~small_mask]
         safe_large = torch.where(
             torch.abs(large_z) < 1e-8,
             torch.full_like(large_z, 1e-8),
             large_z,
         )
-        result[~small_mask] = 1.0 / safe_large
+        gamma_factor = math.gamma(1.0 - alpha)
+        result[~small_mask] = -1.0 / (safe_large * gamma_factor)
 
     return result
 
