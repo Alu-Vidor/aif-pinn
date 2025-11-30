@@ -16,8 +16,8 @@ from aif_pinn import (
     FractionalDerivativeOperator,
     PINNSolver,
     ProblemConfig,
+    mittag_leffler_approx,
 )
-from aif_pinn.config import _mittag_leffler_approx
 
 
 class Visualizer:
@@ -153,7 +153,7 @@ def mittag_leffler_reference(t_eval: np.ndarray, config: ProblemConfig) -> Optio
     t_tensor = torch.as_tensor(t_eval, dtype=torch.float32).reshape(-1, 1)
     eps_alpha = torch.pow(eps, alpha)
     z = -torch.pow(torch.clamp(t_tensor, min=0.0), alpha) / eps_alpha
-    ml = _mittag_leffler_approx(z, alpha, series_terms=12, switch_threshold=1.0)
+    ml = mittag_leffler_approx(z, alpha, series_terms=12, switch_threshold=1.0)
     return (u0 * ml.squeeze(-1)).cpu().numpy()
 
 

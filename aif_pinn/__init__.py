@@ -4,6 +4,7 @@ from .config import (
     FractionalDerivativeOperator,
     PINNSolver,
     ProblemConfig,
+    mittag_leffler_approx,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "FractionalDerivativeOperator",
     "AIFPINNModel",
     "PINNSolver",
+    "mittag_leffler_approx",
 ]
